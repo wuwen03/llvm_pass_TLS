@@ -383,6 +383,10 @@ public:
         }
     }
 
+    const std::map<std::string,SimpleValue *>& getTotal() const {
+        return Total;
+    }
+
 private:
     newTLSImpl *impl;
     std::map<std::string,SimpleValue *> Total;
@@ -416,7 +420,9 @@ bool SkipFunction(const StringRef &Fname) {
 bool newTLSImpl::runOnFunction() {
     SimpleValueFactory factory(this);
     std::set<SimpleValue *> Values;
-    std::map<SimpleValue*,Instruction*> map;
+    std::map<SimpleValue *,Instruction *> map;
+    std::set<BasicBlock *> exitBlock;
+    bool beginning_segment = true;
     for(BasicBlock &BB : F) {
         LastBuilder.SetInsertPoint(BB.getFirstInsertionPt());
         for(Instruction &Inst : make_early_inc_range(BB)) {
@@ -428,25 +434,25 @@ bool newTLSImpl::runOnFunction() {
                 if(isTarget(V)) {
                     errs()<<"is target : "<<V->getName()<<"\n";
                     SimpleValue *SV = factory.newSimpleValue(V);
-                    if(map.count(SV) == 0) {
-                        map[SV] = &Inst;
-                        continue;
-                    }
+                    // if(!beginning_segment && map.count(SV) == 0) {
+                    //     map[SV] = &Inst;
+                    //     continue;
+                    // }
                     Values.insert(SV->get());
                     Inst.setOperand(i,SV->getValue());
-                    if(map[SV] != nullptr) {
-                        for(int j = 0; j < map[SV]->getNumOperands(); j++) {
-                            Value *v = map[SV]->getOperand(j);
-                            if(isTarget(v)) {
-                                SimpleValue *sv = factory.newSimpleValue(v);
-                                if(sv == SV) {
-                                    map[SV]->setOperand(j,sv->getValue());
-                                }
-                            }
-                        }
-                        // map[SV]->replaceUsesOfWith(SV->getTLS(),SV->getValue());
-                        map[SV] = nullptr;
-                    }
+                    // if(!beginning_segment && map[SV] != nullptr) {
+                    //     for(int j = 0; j < map[SV]->getNumOperands(); j++) {
+                    //         Value *v = map[SV]->getOperand(j);
+                    //         if(isTarget(v)) {
+                    //             SimpleValue *sv = factory.newSimpleValue(v);
+                    //             if(sv == SV) {
+                    //                 map[SV]->setOperand(j,sv->getValue());
+                    //             }
+                    //         }
+                    //     }
+                    //     // map[SV]->replaceUsesOfWith(SV->getTLS(),SV->getValue());
+                    //     map[SV] = nullptr;
+                    // }
                 }
             }
             if(CallInst *CI = dyn_cast<CallInst>(&Inst)) {
@@ -456,35 +462,59 @@ bool newTLSImpl::runOnFunction() {
                     ( Callee->isIntrinsic())) {
                     continue;
                 }
-                for(SimpleValue *SV : Values) {
-                    errs()<<"Load "<<SV->getName()<<"\n";
-                    SV->createLoad(LastBuilder);
-                }
+                if(!beginning_segment) {
+                    for(SimpleValue *SV : Values) {
+                        errs()<<"Load "<<SV->getName()<<"\n";
+                        SV->createLoad(LastBuilder);
+                    }
+                } 
                 LastBuilder.SetInsertPoint(&Inst);
                 for(SimpleValue *SV : Values) {
                     errs()<<"Store "<<SV->getName()<<"\n";
                     SV->createStore(LastBuilder);
                 }
+                // start a new segment
                 LastBuilder.SetInsertPoint(Inst.getNextNode());
+                beginning_segment = false;
                 Values.clear();
                 map.clear();
             }            
         }
         errs()<<"values size " << Values.size() << "\n";
-        for(SimpleValue *SV : Values) {
-            errs()<<"Load "<<SV->getName()<<"\n";
-            SV->createLoad(LastBuilder);
+        //处理basic block最后一个Segment的load
+        if(!beginning_segment) {
+            for(SimpleValue *SV : Values) {
+                errs()<<"Load "<<SV->getName()<<"\n";
+                SV->createLoad(LastBuilder);
+            }
         }
-        LastBuilder.SetInsertPoint(&BB.back());
-        for(SimpleValue *SV : Values) {
-            errs()<<"Store "<<SV->getName()<<"\n";
-            SV->createStore(LastBuilder);
+        // LastBuilder.SetInsertPoint(&BB.back());
+        // for(SimpleValue *SV : Values) {
+        //     errs()<<"Store "<<SV->getName()<<"\n";
+        //     SV->createStore(LastBuilder);
+        // }
+
+        if(isa<ReturnInst>(BB.back())) {
+            exitBlock.insert(&BB);
         }
+
         Values.clear();
         map.clear();
     }
+    //insert alloca GEP Load to the beginning of the entry block of a function
     AllocaBuilder.SetInsertPoint(&*F.getEntryBlock().getFirstInsertionPt());
     factory.createAlloca(AllocaBuilder);
+    for(auto [_,SV] : factory.getTotal()) {
+        SV->createLoad(AllocaBuilder);
+    }
+
+    //store the local tls vars back to the global tls var
+    for(auto BB : exitBlock) {
+        AllocaBuilder.SetInsertPoint(&BB->back());
+        for(auto [_,SV] : factory.getTotal()) {
+            SV->createStore(AllocaBuilder);
+        }
+    }
     return true;
 }
 
